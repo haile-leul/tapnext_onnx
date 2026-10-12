@@ -75,6 +75,92 @@ def einsum_to_matmul(model):
   return count
 
 
+def clamp_gelu_cubes(model, limit=20.0):
+  """Inserts Clip(-limit, limit) before every x**3 (tanh-approximate GELU).
+
+  The activations reach |x| ~ 44, so x**3 ~ 87k overflows fp16 (max 65504) and
+  the fused tanh can turn the resulting inf into NaN. For |x| > 20 the tanh
+  argument is already > 350, i.e. tanh == +-1 exactly, so clipping only the
+  cube's input leaves GELU unchanged. Returns count.
+  """
+  from onnx import helper, numpy_helper  # pylint: disable=g-import-not-at-top
+  inits = {i.name: i for i in model.graph.initializer}
+  lo = numpy_helper.from_array(np.array(-limit, np.float32), 'gelu_clip_lo')
+  hi = numpy_helper.from_array(np.array(limit, np.float32), 'gelu_clip_hi')
+  out_nodes, count = [], 0
+  for n in model.graph.node:
+    e = inits.get(n.input[1]) if n.op_type == 'Pow' else None
+    if e is not None and float(numpy_helper.to_array(e)) == 3.0:
+      clipped = n.input[0] + '__clip'
+      out_nodes.append(helper.make_node('Clip', [n.input[0], 'gelu_clip_lo', 'gelu_clip_hi'],
+                                        [clipped], name=n.name + '__clip'))
+      n.input[0] = clipped
+      count += 1
+    out_nodes.append(n)
+  if count:
+    model.graph.initializer.extend([lo, hi])
+  del model.graph.node[:]
+  model.graph.node.extend(out_nodes)
+  return count
+
+
+def prescale_rmsnorm(model, scale=1.0 / 256):
+  """Makes every RMSNorm overflow-free in fp16, independent of layer pinning.
+
+  Pattern: Mul(x, x) -> ReduceMean -> Add(eps) -> Sqrt -> Reciprocal -> Mul(x, r).
+  The residual stream reaches |x| ~ 6e3, so x*x ~ 3e7 overflows fp16. Rewritten
+  as xs = x*scale; Mul(xs, xs) -> ... Add(eps*scale^2) ... -> Mul(xs, r), which
+  is mathematically identical: xs / sqrt(mean(xs^2) + eps*scale^2) = x / sqrt(mean(x^2) + eps).
+  With scale = 1/256, xs^2 stays finite for every fp16-representable x. Returns count.
+  """
+  from onnx import helper, numpy_helper  # pylint: disable=g-import-not-at-top
+  g = model.graph
+  prod = {o: n for n in g.node for o in n.output}
+  cons = collections.defaultdict(list)
+  for n in g.node:
+    for i in n.input:
+      cons[i].append(n)
+  inits = {i.name: i for i in g.initializer}
+  insert_before, count = {}, 0
+  for rm in [n for n in g.node if n.op_type == 'ReduceMean']:
+    sq = prod.get(rm.input[0])
+    if sq is None or sq.op_type != 'Mul' or sq.input[0] != sq.input[1]:
+      continue
+    chain = [rm]
+    for op in ('Add', 'Sqrt', 'Reciprocal', 'Mul'):
+      nxt = [c for c in cons[chain[-1].output[0]] if c.op_type == op]
+      if len(nxt) != 1:
+        break
+      chain.append(nxt[0])
+    if len(chain) != 5:
+      continue
+    _, add, _, _, final = chain
+    x = sq.input[0]
+    if x not in final.input:
+      continue
+    eps_name = next((i for i in add.input if i in inits), None)
+    if eps_name is None:
+      continue
+    k = f'rms{count}'
+    xs = f'{x}__{k}_xs'
+    g.initializer.append(numpy_helper.from_array(np.array(scale, np.float32), f'{k}_scale'))
+    eps = float(numpy_helper.to_array(inits[eps_name]))
+    g.initializer.append(numpy_helper.from_array(np.array(eps * scale * scale, np.float32), f'{k}_eps'))
+    insert_before[id(sq)] = helper.make_node('Mul', [x, f'{k}_scale'], [xs], name=f'{k}_prescale')
+    sq.input[0] = sq.input[1] = xs
+    add.input[list(add.input).index(eps_name)] = f'{k}_eps'
+    final.input[list(final.input).index(x)] = xs
+    count += 1
+  out_nodes = []
+  for n in g.node:
+    if id(n) in insert_before:
+      out_nodes.append(insert_before[id(n)])
+    out_nodes.append(n)
+  del g.node[:]
+  g.node.extend(out_nodes)
+  return count
+
+
 def tag_fp32_nodes(model):
   """Renames ONNX nodes that should stay fp32 with the TAG prefix. Returns count."""
   g = model.graph
@@ -158,6 +244,8 @@ def build(args):
   logger = trt.Logger(trt.Logger.VERBOSE if args.verbose else trt.Logger.WARNING)
   model = onnx.load(args.onnx)
   print('rewrote', einsum_to_matmul(model), 'Einsum nodes as MatMul')
+  print('clamped', clamp_gelu_cubes(model), 'GELU x^3 inputs (fp16 overflow guard)')
+  print('prescaled', prescale_rmsnorm(model), 'RMSNorms (fp16 overflow guard)')
   if args.precision == 'mixed':
     print('tagged', tag_fp32_nodes(model), 'ONNX nodes as fp32')
 
@@ -235,16 +323,26 @@ def verify(args):
     ref_b = make_backend('ort-cpu', args.onnx, q)
   print('reference backend:', ref_b.name)
   worst_xy = worst_vis = 0.0
+  nan_trt = nan_ref = 0
   for t in range(video.shape[0]):
     ins = (video[t:t + 1], qp, t, float(t == 0), np.zeros((1, q), np.float32))
     a = trt_b.step(*ins)
     b = ref_b.step(*ins)
     active = qp[0, :, 0] <= t
-    dxy = np.abs(a[0] - b[0])[active].max()
-    dv = np.abs(a[1] - b[1])[active].max()
+    n_trt = int(sum(np.isnan(x).sum() for x in a))
+    n_ref = int(sum(np.isnan(x).sum() for x in b))
+    nan_trt += n_trt
+    nan_ref += n_ref
+    dxy = float(np.nanmax(np.abs(a[0] - b[0])[active]))
+    dv = float(np.nanmax(np.abs(a[1] - b[1])[active]))
     worst_xy, worst_vis = max(worst_xy, dxy), max(worst_vis, dv)
-    print(f'frame {t}: max|dxy|={dxy:.3f}px  max|dvis|={dv:.4f}')
+    print(f'frame {t}: max|dxy|={dxy:.3f}px  max|dvis|={dv:.4f}  NaNs: engine {n_trt}, reference {n_ref}')
   print(f'WORST: {worst_xy:.3f} px (256-px coords), visibility {worst_vis:.4f}')
+  if nan_trt or nan_ref:
+    print(f'FAILED: NaN outputs (engine {nan_trt}, reference {nan_ref}). '
+          'Rebuild with --precision fp32 to tell a precision problem from a setup problem.')
+    sys.exit(1)
+  print('OK' if worst_xy < 1.0 else 'WARNING: engine deviates by >= 1 px')
 
 
 def main():
