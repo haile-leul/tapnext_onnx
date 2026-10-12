@@ -138,6 +138,9 @@ class TrtBackend:
       raise RuntimeError('could not load engine (built for another GPU / TensorRT version?)')
     self.ctx = self.engine.create_execution_context()
     self.stream = torch.cuda.Stream()
+    self.ev0 = torch.cuda.Event(enable_timing=True)
+    self.ev1 = torch.cuda.Event(enable_timing=True)
+    self.gpu_ms = None
     lru_s, conv_s = _state_shapes(num_slots)
     q = num_slots
     self.in_shapes = {
@@ -184,18 +187,59 @@ class TrtBackend:
                   conv_state_out=self.conv[nxt].data_ptr())
       for n, a in addr.items():
         self.ctx.set_tensor_address(n, a)
+      self.ev0.record(self.stream)
       self.ctx.execute_async_v3(self.stream.cuda_stream)
+      self.ev1.record(self.stream)
       for n in ('tracks_xy', 'visible_prob', 'certainty'):
         h[n].copy_(self.buf[n], non_blocking=True)
     self.stream.synchronize()
+    self.gpu_ms = self.ev0.elapsed_time(self.ev1)
     self.ping = nxt
     return h['tracks_xy'].numpy()[0].copy(), h['visible_prob'].numpy()[0].copy(), \
         h['certainty'].numpy()[0].copy()
 
 
-def make_backend(kind, model_path, num_slots, trt_cache=None):
+class TorchBackend:
+  """Original TAPNext PyTorch weights through the same step wrapper that was
+  exported to ONNX (needs the tapnet repo + bootstapnext_ckpt.npz). Reference
+  point for speed/quality; fp16 = torch.autocast like the official benchmark."""
+
+  def __init__(self, ckpt_path, num_slots, tapnet_root, fp16=True):
+    import sys  # pylint: disable=g-import-not-at-top
+    import torch  # pylint: disable=g-import-not-at-top
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from export_tapnext_onnx import TAPNextStep, load_model  # pylint: disable=g-import-not-at-top
+    if not tapnet_root:
+      raise ValueError('--backend torch needs --tapnet-root (git clone https://github.com/google-deepmind/tapnet)')
+    self.torch, self.q, self.fp16 = torch, num_slots, fp16
+    self.dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    self.fp16 = fp16 and self.dev.type == 'cuda'
+    self.model = TAPNextStep(load_model(tapnet_root, ckpt_path)).to(self.dev).eval()
+    self.name = f'torch {torch.__version__} {self.dev.type} ({"fp16 autocast" if self.fp16 else "fp32"})'
+    self.reset()
+
+  def reset(self):
+    lru_s, conv_s = _state_shapes(self.q)
+    self.lru = self.torch.zeros(lru_s, device=self.dev)
+    self.conv = self.torch.zeros(conv_s, device=self.dev)
+
+  def step(self, frame, query_points, step, video_reset, point_reset):
+    torch, dev = self.torch, self.dev
+    f = lambda a: torch.as_tensor(np.ascontiguousarray(a, np.float32)).to(dev, non_blocking=True)
+    with torch.no_grad(), torch.autocast(self.dev.type, dtype=torch.float16, enabled=self.fp16):
+      xy, vis, cert, lru, conv = self.model(
+          f(frame), f(query_points), f(np.array([step])), f(np.array([video_reset])),
+          f(point_reset), self.lru, self.conv)
+    self.lru, self.conv = lru.float(), conv.float()
+    return (xy[0].float().cpu().numpy(), vis[0].float().cpu().numpy(),
+            cert[0].float().cpu().numpy())
+
+
+def make_backend(kind, model_path, num_slots, trt_cache=None, tapnet_root=None, torch_fp32=False):
   if kind == 'trt':
     return TrtBackend(model_path, num_slots)
+  if kind == 'torch':
+    return TorchBackend(model_path, num_slots, tapnet_root, fp16=not torch_fp32)
   return OrtBackend(model_path, num_slots, provider=kind.split('-', 1)[1], trt_cache=trt_cache)
 
 

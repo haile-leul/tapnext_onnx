@@ -140,6 +140,28 @@ Steps 3–4 in one go: `.\scripts\gpu_quickstart.ps1 -Video C:\videos\gate.mp4 -
 
 (1088 = 1024 + Q.) If it loads here, it loads in your C++ project through `cpp/tapnext_trt_tracker.hpp`. In CMake, set `-DTENSORRT_ROOT=$env:TENSORRT_DIR`.
 
+**Where the output goes:**
+- The video is written **next to the input video** as `<name>_tapnext.mp4`. The script prints the path at start-up.
+- It is finalised at the end of the run, or when you press Ctrl+C. Partial runs are playable.
+- `--benchmark` writes no video.
+- Add `--show` for a live window; press Esc to stop.
+- A progress line prints every 25 frames.
+
+**Speed check, comparing backends on the same pipeline.** The `trt` backend also prints the engine's pure GPU time, measured with CUDA events. The gap between that and the model time is host-side and PCIe overhead.
+
+```powershell
+# original PyTorch TAPNext through the same wrapper (fp16 autocast, like the official benchmark)
+pip install einops
+pip install torchvision --index-url https://download.pytorch.org/whl/cu130
+git clone https://github.com/google-deepmind/tapnet ..\tapnet
+curl.exe -L -o ..\bootstapnext_ckpt.npz https://storage.googleapis.com/dm-tapnet/tapnext/bootstapnext_ckpt.npz
+python run_video.py --video C:\videos\gate.mp4 --backend torch --model ..\bootstapnext_ckpt.npz --tapnet-root ..\tapnet --slots 64 --grid 8 --benchmark --max-frames 100
+
+python run_video.py --video C:\videos\gate.mp4 --backend trt --model models\tapnext_step_256_fp16_q64.engine --slots 64 --grid 8 --benchmark --max-frames 100
+python run_video.py --video C:\videos\gate.mp4 --backend ort-cuda --slots 64 --grid 8 --benchmark --max-frames 100
+& "$env:TENSORRT_DIR\bin\trtexec.exe" --loadEngine=models\tapnext_step_256_fp16_q64.engine --shapes=query_points:1x64x3,point_reset:1x64,lru_state:12x1088x768,conv_state:12x1088x3x768 --noDataTransfers
+```
+
 **Notes:**
 - `--slots` must match the Q the engine was built for. To support a range, build with `--min-q 1 --opt-q 64 --max-q 256`.
 - **If `ort-cuda` reports "GPU provider not available":** run `tools\check_gpu_env.py`. Usually `onnxruntime` and `onnxruntime-gpu` are both installed (uninstall both, then reinstall `onnxruntime-gpu`), or the CUDA/cuDNN DLLs can't be found. With the cu124 torch installed, `onnxruntime-gpu` ≥ 1.21 loads them automatically.
@@ -192,6 +214,7 @@ python run_video.py --video gate.mp4 --backend trt --model models/tapnext_step_2
 ```
 
 - **Backends:**
+  - `torch` (original PyTorch weights; needs `--tapnet-root` and the `.npz` checkpoint)
   - `ort-cpu`
   - `ort-cuda` (needs `onnxruntime-gpu`)
   - `ort-trt` (ONNX Runtime's TensorRT EP, fp16; the engine is cached next to the model)

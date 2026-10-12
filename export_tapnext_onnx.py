@@ -73,7 +73,7 @@ def _gelu(x):
 def _sincos_at(xi, yi, c):
   """Row of posemb_sincos_2d(IMG, IMG, c) at integer pixel (yi, xi). [Q,1] -> [Q,C]."""
   d = c // 4
-  omega = torch.arange(d, dtype=torch.float32) / (d - 1)
+  omega = torch.arange(d, dtype=torch.float32, device=xi.device) / (d - 1)
   omega = 1.0 / (10_000.0**omega)
   ax = xi * omega.view(1, d)
   ay = yi * omega.view(1, d)
@@ -166,7 +166,7 @@ class TAPNextStep(nn.Module):
     logits_y, logits_x = track_logits.chunk(2, dim=-1)  # [Q, 256]
     sy = F.softmax(logits_y, dim=-1)
     sx = F.softmax(logits_x, dim=-1)
-    coords = torch.arange(IMG, dtype=torch.float32) + 0.5
+    coords = torch.arange(IMG, dtype=torch.float32, device=tracks_yx.device) + 0.5
     dy2 = (coords.view(1, IMG) - tracks_yx[:, 0:1]) ** 2  # [Q, 256]
     dx2 = (coords.view(1, IMG) - tracks_yx[:, 1:2]) ** 2
     inside = (dy2.unsqueeze(2) + dx2.unsqueeze(1)) <= (radius**2 + 1e-8)
@@ -202,7 +202,7 @@ class TAPNextStep(nn.Module):
     track_logits = m.coordinate_head(pts)  # [Q, 512]  (y logits, x logits)
     soft_argmax_threshold = 20
     pos_y, pos_x = track_logits.chunk(2, dim=-1)
-    index = torch.arange(IMG, dtype=torch.float32).view(1, IMG)
+    index = torch.arange(IMG, dtype=torch.float32, device=track_logits.device).view(1, IMG)
 
     def soft_argmax(logits):
       am = logits.argmax(dim=-1, keepdim=True).float()
