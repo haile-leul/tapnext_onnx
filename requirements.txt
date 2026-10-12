@@ -1,0 +1,12 @@
+# torch: install a CUDA build first, e.g.  pip install torch --index-url https://download.pytorch.org/whl/cu130
+numpy
+opencv-python
+pyyaml
+transformers==4.56.1   # DINOv3 support
+timm==1.0.12
+einops
+huggingface_hub
+onnx
+onnxscript
+onnxruntime-gpu        # uninstall plain `onnxruntime` first, they conflict
+# tensorrt: install the wheel shipped with your TensorRT (<TensorRT>/python/tensorrt-*-cpXY-*.whl)

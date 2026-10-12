@@ -1,3 +1,6 @@
 __pycache__/
-build/
 models/*.onnx
+models/*.onnx.data
+models/*.engine
+build/
+*_trackon.mp4
