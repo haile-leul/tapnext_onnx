@@ -88,15 +88,17 @@ git clone -b claude/magical-mccarthy-t34jfd https://github.com/haile-leul/tapnex
 cd tapnext_onnx
 ```
 
-**2. Install packages into the venv.** Use Python 3.10–3.12 with an NVIDIA driver recent enough for CUDA 12. Pip's default `torch` on Windows is CPU-only, so install it from the CUDA index.
+**2. Install packages into the venv.** Use Python 3.10–3.12. `onnxruntime-gpu`, `torch` and `tensorrt` must all use the **same CUDA major version**. The latest `onnxruntime-gpu` is built for CUDA 13, so use CUDA 13 everywhere. The pip packages ship their own CUDA DLLs; the driver only needs to support CUDA 13. Pip's default `torch` on Windows is CPU-only, so install it from the CUDA index.
 
 ```powershell
 python -m pip install -U pip
-pip install torch --index-url https://download.pytorch.org/whl/cu124
-pip uninstall -y onnxruntime            # the CPU and GPU packages conflict
-pip install onnxruntime-gpu tensorrt-cu12 onnx opencv-python numpy
-python tools\check_gpu_env.py           # should end with "ALL GOOD"
+pip uninstall -y onnxruntime torch tensorrt tensorrt-cu12 tensorrt-cu12-libs tensorrt-cu12-bindings
+pip install torch --index-url https://download.pytorch.org/whl/cu130
+pip install onnxruntime-gpu tensorrt-cu13 onnx opencv-python numpy
+python tools\check_gpu_env.py           # must say "test session runs on: CUDAExecutionProvider" and end with ALL GOOD
 ```
+
+To stay on CUDA 12 instead (for example, because your C++ project links a CUDA 12 TensorRT), install the `cu126` torch, `tensorrt-cu12`, and an `onnxruntime-gpu` release built for CUDA 12. Never mix 12 and 13.
 
 **3. Reassemble the ONNX and build the TensorRT engine.** The build takes a few minutes. Afterwards it prints how far the engine is from ONNX Runtime; expect well under 1 px.
 

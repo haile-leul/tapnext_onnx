@@ -23,17 +23,26 @@ def _state_shapes(q):
   return (NUM_LAYERS, n, WIDTH), (NUM_LAYERS, n, 3, WIDTH)
 
 
+def _load_cuda_dlls(ort):
+  """Windows: make the CUDA/cuDNN DLLs shipped with torch (or pip nvidia-*) visible to onnxruntime-gpu."""
+  try:
+    import torch  # noqa: F401  pylint: disable=g-import-not-at-top,unused-import
+  except Exception:  # pylint: disable=broad-except
+    pass
+  if hasattr(ort, 'preload_dlls'):
+    try:
+      ort.preload_dlls()
+    except Exception:  # pylint: disable=broad-except
+      pass
+
+
 class OrtBackend:
   """onnxruntime backend; the recurrent state never leaves the device."""
 
   def __init__(self, model_path, num_slots, provider='cpu', trt_cache=None):
     import onnxruntime as ort  # pylint: disable=g-import-not-at-top
-    if provider != 'cpu' and hasattr(ort, 'preload_dlls'):
-      # Windows: load CUDA/cuDNN DLLs from the pip nvidia-* / torch packages.
-      try:
-        ort.preload_dlls()
-      except Exception:  # pylint: disable=broad-except
-        pass
+    if provider != 'cpu':
+      _load_cuda_dlls(ort)
     self.q = num_slots
     so = ort.SessionOptions()
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
