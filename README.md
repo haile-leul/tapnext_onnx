@@ -10,7 +10,8 @@ This is a streaming ONNX export of [BootsTAPNext](https://github.com/google-deep
 | `export_tapnext_onnx.py` | Rebuilds the full fp32 model (`tapnext_step_256.onnx`, 779 MB) from the checkpoint. |
 | `tools/convert_fp16.py` | Converts the fp32 model into the `w16` file. |
 | `tools/check_parity_torch.py`, `tools/check_onnx.py`, `tools/check_midstream.py` | Checks against the original PyTorch TAPNext. |
-| `scripts/gpu_quickstart.sh` | Runs every GPU step in order: reassemble, install, build the engine, benchmark, render. |
+| `scripts/gpu_quickstart.sh`, `scripts/gpu_quickstart.ps1` | Run every GPU step in order (Linux / Windows). |
+| `tools/reassemble_model.py`, `tools/check_gpu_env.py` | Join the model parts with a checksum check, and check the GPU environment. |
 | `tools/build_trt_engine.py` | Builds the TensorRT fp16 engine on your GPU, then checks it against ONNX Runtime. |
 | `run_video.py`, `tapnext_runtime.py` | Runs a video through ONNX Runtime (CPU/CUDA/TensorRT EP) or a TensorRT engine, with mid-video point adds, and writes a video with tracks, a CSV and timing. |
 | `cpp/tapnext_points.hpp` | Shared C++ slot, ROI and velocity logic. |
@@ -75,6 +76,57 @@ The script runs these steps in order:
 5. Writes `<video>_tapnext_trt.mp4` and `.csv`.
 
 The sections below explain each step.
+
+## Windows (PowerShell, venv active)
+
+Run everything from the repo root.
+
+**1. Get the code.** Skip this if you already cloned the repo.
+
+```powershell
+git clone -b claude/magical-mccarthy-t34jfd https://github.com/haile-leul/tapnext_onnx
+cd tapnext_onnx
+```
+
+**2. Install packages into the venv.** Use Python 3.10–3.12 with an NVIDIA driver recent enough for CUDA 12. Pip's default `torch` on Windows is CPU-only, so install it from the CUDA index.
+
+```powershell
+python -m pip install -U pip
+pip install torch --index-url https://download.pytorch.org/whl/cu124
+pip uninstall -y onnxruntime            # the CPU and GPU packages conflict
+pip install onnxruntime-gpu tensorrt-cu12 onnx opencv-python numpy
+python tools\check_gpu_env.py           # should end with "ALL GOOD"
+```
+
+**3. Reassemble the ONNX and build the TensorRT engine.** The build takes a few minutes. Afterwards it prints how far the engine is from ONNX Runtime; expect well under 1 px.
+
+```powershell
+python tools\reassemble_model.py
+python tools\build_trt_engine.py --onnx models\tapnext_step_256_w16.onnx --engine models\tapnext_step_256_fp16_q64.engine --min-q 64 --opt-q 64 --max-q 64
+```
+
+**4. Test speed and tracking quality.**
+
+```powershell
+# speed: ONNX Runtime CUDA vs TensorRT
+python run_video.py --video C:\videos\gate.mp4 --backend ort-cuda --slots 64 --grid 8 --benchmark --max-frames 200
+python run_video.py --video C:\videos\gate.mp4 --backend trt --model models\tapnext_step_256_fp16_q64.engine --slots 64 --grid 8 --benchmark --max-frames 200
+
+# quality: writes C:\videos\gate_tapnext.mp4 (+ CSV)
+python run_video.py --video C:\videos\gate.mp4 --backend trt --model models\tapnext_step_256_fp16_q64.engine --slots 64 --grid 8 --reseed-every 15 --reseed-grid 6 --drop-after 5 --csv C:\videos\gate_tracks.csv
+
+# add points mid-video, or click them yourself on frames 0 and 30
+python run_video.py --video C:\videos\gate.mp4 --backend trt --model models\tapnext_step_256_fp16_q64.engine --slots 64 --add "40:812,430;900,455" --add-grid "55:700,350,300,200:4"
+python run_video.py --video C:\videos\gate.mp4 --backend trt --model models\tapnext_step_256_fp16_q64.engine --slots 64 --pick 0 --pick 30 --show
+```
+
+Steps 3–4 in one go: `.\scripts\gpu_quickstart.ps1 -Video C:\videos\gate.mp4 -Q 64`.
+
+**Notes:**
+- `--slots` must match the Q the engine was built for. To support a range, build with `--min-q 1 --opt-q 64 --max-q 256`.
+- To use the engine from your C++ project, build it with the same TensorRT version your C++ project links against. Check with `python -c "import tensorrt; print(tensorrt.__version__)"`. If they differ, install the matching wheel, e.g. `pip install tensorrt-cu12==10.x.y`.
+- **If `ort-cuda` reports "GPU provider not available":** run `tools\check_gpu_env.py`. Usually `onnxruntime` and `onnxruntime-gpu` are both installed (uninstall both, then reinstall `onnxruntime-gpu`), or the CUDA/cuDNN DLLs can't be found. With the cu124 torch installed, `onnxruntime-gpu` ≥ 1.21 loads them automatically.
+- **If `.ps1` scripts are blocked:** run `Set-ExecutionPolicy -Scope Process Bypass` first.
 
 ## TensorRT fp16 engine
 

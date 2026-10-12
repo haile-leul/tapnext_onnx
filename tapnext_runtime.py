@@ -28,6 +28,12 @@ class OrtBackend:
 
   def __init__(self, model_path, num_slots, provider='cpu', trt_cache=None):
     import onnxruntime as ort  # pylint: disable=g-import-not-at-top
+    if provider != 'cpu' and hasattr(ort, 'preload_dlls'):
+      # Windows: load CUDA/cuDNN DLLs from the pip nvidia-* / torch packages.
+      try:
+        ort.preload_dlls()
+      except Exception:  # pylint: disable=broad-except
+        pass
     self.q = num_slots
     so = ort.SessionOptions()
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
