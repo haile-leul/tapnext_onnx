@@ -23,6 +23,30 @@ def _state_shapes(q):
   return (NUM_LAYERS, n, WIDTH), (NUM_LAYERS, n, 3, WIDTH)
 
 
+def import_tensorrt():
+  """Imports tensorrt; honours TENSORRT_DIR (a TensorRT zip install, e.g.
+  D:\\...\\tensorrt_10.14.1.48_CUDA13) so the Python side uses the very same
+  DLLs as the C++ project. Warns if the version differs from TENSORRT_VERSION."""
+  trt_dir = os.environ.get('TENSORRT_DIR')
+  if trt_dir:
+    for sub in ('bin', 'lib'):
+      d = os.path.join(trt_dir, sub)
+      if os.path.isdir(d):
+        os.environ['PATH'] = d + os.pathsep + os.environ.get('PATH', '')
+        if hasattr(os, 'add_dll_directory'):
+          os.add_dll_directory(d)
+  try:
+    import torch  # noqa: F401  load torch's CUDA runtime first (Windows)  pylint: disable=g-import-not-at-top,unused-import
+  except Exception:  # pylint: disable=broad-except
+    pass
+  import tensorrt as trt  # pylint: disable=g-import-not-at-top
+  want = os.environ.get('TENSORRT_VERSION')
+  if want and trt.__version__ != want:
+    print(f'WARNING: tensorrt {trt.__version__} != TENSORRT_VERSION {want}; '
+          'engines only load in the TensorRT version that built them')
+  return trt
+
+
 def _load_cuda_dlls(ort):
   """Windows: make the CUDA/cuDNN DLLs shipped with torch (or pip nvidia-*) visible to onnxruntime-gpu."""
   try:
@@ -103,7 +127,7 @@ class TrtBackend:
   """Native TensorRT engine; device buffers via torch."""
 
   def __init__(self, engine_path, num_slots):
-    import tensorrt as trt  # pylint: disable=g-import-not-at-top
+    trt = import_tensorrt()
     import torch  # pylint: disable=g-import-not-at-top
     self.torch, self.q = torch, num_slots
     self.name = f'trt ({trt.__version__})'

@@ -61,7 +61,14 @@ if ort is not None:
     print('  -> CUDA EP not usable. onnxruntime-gpu, torch and tensorrt must all use the same CUDA major '
           '(see README, Windows section); also make sure plain `onnxruntime` is NOT installed.')
 
-trt, v = ver('tensorrt')
+try:
+  import os  # pylint: disable=g-import-not-at-top
+  sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+  from tapnext_runtime import import_tensorrt  # pylint: disable=g-import-not-at-top
+  trt = import_tensorrt()
+  v = trt.__version__
+except Exception as e:  # pylint: disable=broad-except
+  trt, v = None, f'NOT AVAILABLE ({type(e).__name__}: {e})'
 print('tensorrt    ', v)
 if trt is None:
   ok = False

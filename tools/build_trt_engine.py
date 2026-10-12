@@ -115,7 +115,10 @@ def tag_fp32_nodes(model):
 
 
 def build(args):
-  import tensorrt as trt  # pylint: disable=g-import-not-at-top
+  sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+  from tapnext_runtime import import_tensorrt  # pylint: disable=g-import-not-at-top
+  trt = import_tensorrt()
+  print('TensorRT', trt.__version__)
   logger = trt.Logger(trt.Logger.VERBOSE if args.verbose else trt.Logger.WARNING)
   model = onnx.load(args.onnx)
   if args.precision == 'mixed':

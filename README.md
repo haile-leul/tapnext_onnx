@@ -88,17 +88,25 @@ git clone -b claude/magical-mccarthy-t34jfd https://github.com/haile-leul/tapnex
 cd tapnext_onnx
 ```
 
-**2. Install packages into the venv.** Use Python 3.10–3.12. `onnxruntime-gpu`, `torch` and `tensorrt` must all use the **same CUDA major version**. The latest `onnxruntime-gpu` is built for CUDA 13, so use CUDA 13 everywhere. The pip packages ship their own CUDA DLLs; the driver only needs to support CUDA 13. Pip's default `torch` on Windows is CPU-only, so install it from the CUDA index.
+**2. Install packages into the venv.** Use Python 3.10–3.12. Use the **same TensorRT version as your C++ project**, because an engine only loads in the TensorRT version that built it. The example below uses TensorRT 10.14.1.48 for CUDA 13; adjust the path to your install. `onnxruntime-gpu`, `torch` and TensorRT must all be CUDA 13 builds. Pip's default `torch` on Windows is CPU-only, so install it from the CUDA index.
 
 ```powershell
+$env:TENSORRT_DIR = "D:\SVN\PTnD\extern\tensorrt_10.14.1.48_CUDA13"   # your C++ project's TensorRT
+$env:TENSORRT_VERSION = "10.14.1.48"                                  # warn if Python loads another version
+
 python -m pip install -U pip
-pip uninstall -y onnxruntime torch tensorrt tensorrt-cu12 tensorrt-cu12-libs tensorrt-cu12-bindings
+pip uninstall -y onnxruntime torch tensorrt tensorrt-cu12 tensorrt-cu12-libs tensorrt-cu12-bindings tensorrt-cu13 tensorrt-cu13-libs tensorrt-cu13-bindings
 pip install torch --index-url https://download.pytorch.org/whl/cu130
-pip install onnxruntime-gpu tensorrt-cu13 onnx opencv-python numpy
-python tools\check_gpu_env.py           # must say "test session runs on: CUDAExecutionProvider" and end with ALL GOOD
+pip install onnxruntime-gpu onnx opencv-python numpy
+
+# TensorRT Python bindings from the SAME zip (matching your Python, e.g. cp311):
+pip install (Get-ChildItem "$env:TENSORRT_DIR\python\tensorrt-*-cp311-none-win_amd64.whl").FullName
+#   (if that zip has no python\ folder: pip install tensorrt-cu13==10.14.1.48)
+
+python tools\check_gpu_env.py   # must show tensorrt 10.14.1.48, "test session runs on: CUDAExecutionProvider", ALL GOOD
 ```
 
-To stay on CUDA 12 instead (for example, because your C++ project links a CUDA 12 TensorRT), install the `cu126` torch, `tensorrt-cu12`, and an `onnxruntime-gpu` release built for CUDA 12. Never mix 12 and 13.
+`TENSORRT_DIR` adds `<dir>\bin` and `<dir>\lib` to the DLL search path, so Python uses the same `nvinfer` DLLs as your C++ build. Set it in every new PowerShell window, or once with `setx TENSORRT_DIR ...` and `setx TENSORRT_VERSION ...`.
 
 **3. Reassemble the ONNX and build the TensorRT engine.** The build takes a few minutes. Afterwards it prints how far the engine is from ONNX Runtime; expect well under 1 px.
 
@@ -122,11 +130,18 @@ python run_video.py --video C:\videos\gate.mp4 --backend trt --model models\tapn
 python run_video.py --video C:\videos\gate.mp4 --backend trt --model models\tapnext_step_256_fp16_q64.engine --slots 64 --pick 0 --pick 30 --show
 ```
 
-Steps 3–4 in one go: `.\scripts\gpu_quickstart.ps1 -Video C:\videos\gate.mp4 -Q 64`.
+Steps 3–4 in one go: `.\scripts\gpu_quickstart.ps1 -Video C:\videos\gate.mp4 -Q 64 -TensorrtDir D:\SVN\PTnD\extern\tensorrt_10.14.1.48_CUDA13`.
+
+**5. Check the engine with your C++ TensorRT install (no Python involved).** This loads the engine with the same DLLs your project uses and reports GPU latency:
+
+```powershell
+& "$env:TENSORRT_DIR\bin\trtexec.exe" --loadEngine=models\tapnext_step_256_fp16_q64.engine --shapes=query_points:1x64x3,point_reset:1x64,lru_state:12x1088x768,conv_state:12x1088x3x768 --useCudaGraph --noDataTransfers
+```
+
+(1088 = 1024 + Q.) If it loads here, it loads in your C++ project through `cpp/tapnext_trt_tracker.hpp`. In CMake, set `-DTENSORRT_ROOT=$env:TENSORRT_DIR`.
 
 **Notes:**
 - `--slots` must match the Q the engine was built for. To support a range, build with `--min-q 1 --opt-q 64 --max-q 256`.
-- To use the engine from your C++ project, build it with the same TensorRT version your C++ project links against. Check with `python -c "import tensorrt; print(tensorrt.__version__)"`. If they differ, install the matching wheel, e.g. `pip install tensorrt-cu12==10.x.y`.
 - **If `ort-cuda` reports "GPU provider not available":** run `tools\check_gpu_env.py`. Usually `onnxruntime` and `onnxruntime-gpu` are both installed (uninstall both, then reinstall `onnxruntime-gpu`), or the CUDA/cuDNN DLLs can't be found. With the cu124 torch installed, `onnxruntime-gpu` ≥ 1.21 loads them automatically.
 - **If `.ps1` scripts are blocked:** run `Set-ExecutionPolicy -Scope Process Bypass` first.
 
