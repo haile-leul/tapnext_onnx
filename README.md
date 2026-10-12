@@ -1,6 +1,6 @@
 # TAPNext (BootsTAPNext, 256×256) → ONNX
 
-This is a streaming ONNX export of [BootsTAPNext](https://github.com/google-deepmind/tapnet), the online point tracker from google-deepmind/tapnet. It uses the official `bootstapnext_ckpt.npz` checkpoint with the TRecViT-B/8 backbone at 256×256. It also includes a C++ (ONNX Runtime + OpenCV) wrapper that returns per-point positions and velocities.
+This is a streaming ONNX export of [BootsTAPNext](https://github.com/google-deepmind/tapnet), the online point tracker from google-deepmind/tapnet. It uses the official `bootstapnext_ckpt.npz` checkpoint with the TRecViT-B/8 backbone at 256×256. It also includes C++ wrappers for ONNX Runtime and TensorRT that return per-point positions and velocities, a TensorRT fp16 engine builder, and a Python script that runs a video on the GPU and renders the tracks.
 
 ## Files
 
@@ -10,7 +10,13 @@ This is a streaming ONNX export of [BootsTAPNext](https://github.com/google-deep
 | `export_tapnext_onnx.py` | Rebuilds the full fp32 model (`tapnext_step_256.onnx`, 779 MB) from the checkpoint. |
 | `tools/convert_fp16.py` | Converts the fp32 model into the `w16` file. |
 | `tools/check_parity_torch.py`, `tools/check_onnx.py`, `tools/check_midstream.py` | Checks against the original PyTorch TAPNext. |
-| `cpp/tapnext_tracker.hpp`, `cpp/demo.cpp`, `cpp/CMakeLists.txt` | C++ wrapper and demo. |
+| `scripts/gpu_quickstart.sh` | Runs every GPU step in order: reassemble, install, build the engine, benchmark, render. |
+| `tools/build_trt_engine.py` | Builds the TensorRT fp16 engine on your GPU, then checks it against ONNX Runtime. |
+| `run_video.py`, `tapnext_runtime.py` | Runs a video through ONNX Runtime (CPU/CUDA/TensorRT EP) or a TensorRT engine, with mid-video point adds, and writes a video with tracks, a CSV and timing. |
+| `cpp/tapnext_points.hpp` | Shared C++ slot, ROI and velocity logic. |
+| `cpp/tapnext_tracker.hpp` | C++ ONNX Runtime backend. |
+| `cpp/tapnext_trt_tracker.hpp` | C++ TensorRT backend; the state stays on the GPU. |
+| `cpp/demo.cpp`, `cpp/CMakeLists.txt` | C++ demo for both backends. |
 
 ## Reassembling the model
 
@@ -51,21 +57,107 @@ To add a point at frame `t`, write `(t, x, y)` into a free slot. If that slot ha
 - **Wrapper vs. original `TAPNext.forward`** (12 frames, points queried at frames 0 and 3, edge points): max difference 6e-5 px.
 - **ONNX Runtime fp32 vs. original PyTorch:** max 1.4e-4 px. **w16 vs. original PyTorch:** max 0.016 px.
 - **Synthetic object moving (14, 3) px/frame:** the C++ demo measures v = (14.0, 3.0).
+- **`run_video.py` (ort-cpu) on a 1280×720 synthetic clip** with true motion (70, 8.44) px/frame and points added at frames 0, 4 and 6: measured velocities are 70.2 ± 0.3 and 8.5 ± 0.2.
+- **TensorRT:** not tested here because this machine has no GPU. The C++ TensorRT backend compiles against the TensorRT 10.13 headers. `tools/build_trt_engine.py` checks the engine against ONNX Runtime after building.
+
+## Quick start on a GPU machine
+
+```bash
+bash scripts/gpu_quickstart.sh path/to/gate_video.mp4 64
+```
+
+The script runs these steps in order:
+
+1. Reassembles and checksums the ONNX.
+2. Installs the Python dependencies.
+3. Builds and verifies the TensorRT fp16 engine for Q=64.
+4. Benchmarks ONNX Runtime CUDA against TensorRT.
+5. Writes `<video>_tapnext_trt.mp4` and `.csv`.
+
+The sections below explain each step.
+
+## TensorRT fp16 engine
+
+A TensorRT engine only runs on the GPU architecture and TensorRT version it was built with, so build it on your machine:
+
+```bash
+pip install tensorrt onnx onnxruntime-gpu torch   # torch is only used for GPU buffers in Python
+python tools/build_trt_engine.py --onnx models/tapnext_step_256_w16.onnx \
+    --engine models/tapnext_step_256_fp16.engine --min-q 1 --opt-q 64 --max-q 256
+```
+
+The default `--precision mixed` runs most of the network in fp16. It pins these numerically sensitive parts to fp32:
+
+- RMSNorm square → mean → rsqrt (x² can overflow fp16)
+- LayerNorms
+- RG-LRU decay and state update (a ≈ 1 − 1e-4 rounds to 1 in fp16)
+- output heads, soft-argmax and certainty (coordinates need sub-pixel precision)
+
+All of these are cheap elementwise or per-point ops.
+
+After building, the script runs the engine and ONNX Runtime side by side on a synthetic clip and prints the largest position and visibility differences. Expect well under 1 px in 256-px coordinates. If it is much larger, compare against `--precision fp32`. `--precision fp16` lets TensorRT choose freely (fastest, but may drift).
+
+Engine inputs and outputs have the same names, shapes and fp32 types as the ONNX graph. `Q` must lie within the `--min-q`..`--max-q` range. For the best speed with a fixed slot count, set all three to that value.
+
+`trtexec --onnx=models/tapnext_step_256_w16.onnx --fp16 --saveEngine=...` with matching `--minShapes/--optShapes/--maxShapes` also works, but trtexec does not pin the fp32 layers. Check an engine built that way with `python tools/build_trt_engine.py --verify-only --engine <file>`.
+
+## Testing on a video (Python, GPU)
+
+```bash
+# onnxruntime-gpu (CUDA EP); the state stays in GPU memory
+python run_video.py --video gate.mp4 --backend ort-cuda --grid 8
+
+# native TensorRT engine, ROI on the lanes, fresh 6x6 grid every 15 frames, drop points that stay lost
+python run_video.py --video gate.mp4 --backend trt --model models/tapnext_step_256_fp16.engine \
+    --roi 400,200,1100,800 --reseed-every 15 --reseed-grid 6 --drop-after 5 --csv tracks.csv
+
+# add points mid-video: 2 points at frame 40, a 4x4 grid in a box at frame 55
+python run_video.py --video gate.mp4 --backend ort-cuda \
+    --add "40:812,430;900,455" --add-grid "55:700,350,300,200:4"
+
+# click points yourself on frames 0 and 30 (needs a display)
+python run_video.py --video gate.mp4 --backend ort-cuda --pick 0 --pick 30
+
+# timing only
+python run_video.py --video gate.mp4 --backend trt --model models/tapnext_step_256_fp16.engine --benchmark
+```
+
+- **Backends:**
+  - `ort-cpu`
+  - `ort-cuda` (needs `onnxruntime-gpu`)
+  - `ort-trt` (ONNX Runtime's TensorRT EP, fp16; the engine is cached next to the model)
+  - `trt` (`.engine` file; needs `tensorrt` + `torch`)
+- **Coordinates:** all coordinates are in original video pixels.
+- **Point modes:** `--grid`, `--add`, `--add-grid`, `--points-json`, `--pick`, `--reseed-every`.
+- **Slots:** `--slots` is the fixed slot count `Q` (default 64). When all slots are busy, the oldest point is evicted. `--drop-after N` frees a slot after N unreliable frames in a row.
+- **Output video:**
+  - one colour per point with a trail
+  - a white arrow for velocity (`--vel-scale`)
+  - unreliable points are hidden unless you pass `--show-unreliable`
+  - the ROI is drawn as a box
+  - a header line shows model latency and FPS
+- **Timing:** reported after a warm-up as model mean/p50/p95 ms and FPS, plus preprocessing and end-to-end time.
+- **CSV:** `--csv` writes `frame, point_id, slot, x, y, vx, vy, visible, certainty, reliable` for every active point.
 
 ## C++
 
 ```bash
-cmake -S cpp -B build -DONNXRUNTIME_ROOT=/path/to/onnxruntime-linux-x64-1.22.0
+cmake -S cpp -B build -DONNXRUNTIME_ROOT=/path/to/onnxruntime-linux-x64-1.22.0 \
+      -DWITH_TENSORRT=ON -DTENSORRT_ROOT=/path/to/TensorRT-10.x
 cmake --build build
-./build/tapnext_demo models/tapnext_step_256_w16.onnx video.mp4 [cuda]
+./build/tapnext_demo models/tapnext_step_256_fp16.engine video.mp4      # TensorRT
+./build/tapnext_demo models/tapnext_step_256_w16.onnx video.mp4 [cuda]  # ONNX Runtime
 ```
 
-See `cpp/tapnext_tracker.hpp` for `addPoint`, `removePoint`, `step` (which returns `x, y, vx, vy, visible, certainty` in original image pixels) and `medianVelocity(box)`.
+`TapNextTrtTracker` (`cpp/tapnext_trt_tracker.hpp`) and `TapNextTracker` (`cpp/tapnext_tracker.hpp`) share the API in `cpp/tapnext_points.hpp`:
 
-Performance notes:
-- Each frame moves about 150 MB of state (Q≈64). On GPU, bind the state tensors to device memory (IoBinding with CUDA memory, ping-ponged) so the state never round-trips to the host.
-- For fp16 compute, give the fp32 or w16 model to TensorRT (`trtexec --fp16`, or the ORT TensorRT EP with `trt_fp16_enable`).
-- Feed a fixed ROI around the gate lanes instead of the whole frame. The ROI is resized to 256×256, so a tighter ROI gives more effective resolution.
+- `addPoint`, `removePoint`
+- `step`, which returns `x, y, vx, vy, visible, certainty` in original image pixels
+- `medianVelocity(box)`
+
+The TensorRT version keeps the recurrent state (about 150 MB at Q=64) in two GPU buffers that swap each frame. Only the 256×256 frame, the queries and the Q outputs cross PCIe. The ONNX Runtime C++ version keeps the state in host memory, which is fine for CPU but slow on GPU.
+
+Feed a fixed ROI around the gate lanes instead of the whole frame. The ROI is resized to 256×256, so a tighter ROI gives more effective resolution.
 
 ## Rebuilding
 
