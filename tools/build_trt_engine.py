@@ -39,6 +39,42 @@ ELEMENTWISE = {'Mul', 'Add', 'Sub', 'Div', 'Sqrt', 'Reciprocal', 'Pow', 'Where',
                'Exp', 'Neg', 'Max', 'Min'}
 
 
+def einsum_to_matmul(model):
+  """Rewrites the graph's Einsum nodes as (Transpose +) MatMul.
+
+  TensorRT's ONNX parser rejects upper-case Einsum subscripts, and MatMul is
+  the better-supported path anyway. Exact same maths. Returns count.
+  """
+  from onnx import helper  # pylint: disable=g-import-not-at-top
+  out_nodes, count = [], 0
+  for n in model.graph.node:
+    eq = next((a.s.decode() for a in n.attribute if a.name == 'equation'), None)
+    if n.op_type != 'Einsum':
+      out_nodes.append(n)
+    elif eq == 'nd,cdD->cnD':  # [n,d] @ [c,d,D] -> [c,n,D]  (MatMul broadcasts)
+      out_nodes.append(helper.make_node('MatMul', list(n.input), list(n.output), name=n.name))
+      count += 1
+    elif eq == 'nhi,hij->nhj':  # block-diagonal linear
+      xt, yt = n.output[0] + '__xt', n.output[0] + '__yt'
+      out_nodes += [
+          helper.make_node('Transpose', [n.input[0]], [xt], perm=[1, 0, 2], name=n.name + '__t0'),
+          helper.make_node('MatMul', [xt, n.input[1]], [yt], name=n.name),
+          helper.make_node('Transpose', [yt], [n.output[0]], perm=[1, 0, 2], name=n.name + '__t1'),
+      ]
+      count += 1
+    else:  # unknown pattern: at least make the subscripts lower-case
+      letters = sorted({c for c in eq if c.isalpha()})
+      free = [c for c in 'abcdefghijklmnopqrstuvwxyz' if c not in letters]
+      remap = {c: (c if c.islower() else free.pop(0)) for c in letters}
+      for a in n.attribute:
+        if a.name == 'equation':
+          a.s = ''.join(remap.get(c, c) for c in eq).encode()
+      out_nodes.append(n)
+  del model.graph.node[:]
+  model.graph.node.extend(out_nodes)
+  return count
+
+
 def tag_fp32_nodes(model):
   """Renames ONNX nodes that should stay fp32 with the TAG prefix. Returns count."""
   g = model.graph
@@ -121,6 +157,7 @@ def build(args):
   print('TensorRT', trt.__version__)
   logger = trt.Logger(trt.Logger.VERBOSE if args.verbose else trt.Logger.WARNING)
   model = onnx.load(args.onnx)
+  print('rewrote', einsum_to_matmul(model), 'Einsum nodes as MatMul')
   if args.precision == 'mixed':
     print('tagged', tag_fp32_nodes(model), 'ONNX nodes as fp32')
 

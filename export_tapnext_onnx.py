@@ -57,7 +57,7 @@ def _block_diag_linear(mod, x):
   n = x.shape[0]
   h, bw, _ = mod.w.shape
   x = x.reshape(n, h, bw)
-  y = torch.einsum('nhi,hij->nhj', x, mod.w) + mod.b
+  y = torch.matmul(x.transpose(0, 1), mod.w).transpose(0, 1) + mod.b  # [N, H, bw]
   return y.reshape(n, h * bw)
 
 
@@ -143,7 +143,7 @@ class TAPNextStep(nn.Module):
     residual = xo + raw_x
     xm = _rms_norm(blk.channel_pre_norm, residual)
     mlp = blk.mlp_block
-    up = torch.einsum('nd,cdD->cnD', xm, mlp.ffw_up.w) + mlp.ffw_up.b[:, 0]
+    up = torch.matmul(xm, mlp.ffw_up.w) + mlp.ffw_up.b[:, 0]  # [2, N, D]
     xm = mlp.ffw_down(_gelu(up[0]) * up[1])
     return xm + residual, new_h, new_conv
 
