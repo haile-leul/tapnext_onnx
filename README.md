@@ -125,7 +125,21 @@ Steps 2–4 in one go:
 | `--drop-after N` | remove points that are invisible for N frames in a row |
 | `--max-points` | cap; the oldest points are removed first |
 | `--pick F` | click points on frame F |
+| `--dets FILE` | detection mode, see below |
 | `--points-json` | read the schedule from a file |
+
+**Detection mode** (`--dets`). Every `--det-every` frames (default 30), all tracked points are removed. Then `--det-points` points (default 10) are sampled in each unique detection box of that frame.
+- **File format:** one box per line, e.g. `frame id x y w h ? class score -1 …`.
+- **Columns:** set with `--det-cols "0,2,3,4,5,7,8"`, the 0-based columns of frame, x, y, w, h, class and score.
+- **Box coordinates:** `x,y` is the top-left corner; use `--det-xy center` if the file gives centres.
+- **Filters:** `--det-classes 5`, `--det-min-score 0.5`.
+- **Duplicates:** boxes overlapping with IoU ≥ `--det-dedup-iou` (default 0.9) count as one.
+- **Sampling:** points are spread over the box and kept `--det-shrink` (default 0.15) of the box size away from its edges.
+- **Output video:** draws the frame's detections, and points are coloured by the box they came from.
+
+```bash
+python run_video.py --video gate.mp4 --backend trt --dets gate_dets.txt --det-every 30 --det-points 10 --csv tracks.csv
+```
 
 **Output.**
 - The video is written next to the input as `<name>_trackon.mp4`. It is finalised at the end or on Ctrl+C.

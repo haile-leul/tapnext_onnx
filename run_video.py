@@ -12,6 +12,9 @@ Examples (all coordinates in ORIGINAL video pixels):
   # fresh 6x6 grid every 15 frames, drop points invisible for 10 frames
   python run_video.py --video gate.mp4 --backend trt --reseed-every 15 --reseed-grid 6 --drop-after 10
 
+  # detections: every 30 frames drop all points and put 10 points in each detection box
+  python run_video.py --video gate.mp4 --backend trt --dets gate_dets.txt --det-every 30 --det-points 10
+
   # original PyTorch model / ONNX Runtime
   python run_video.py --video gate.mp4 --backend torch --trackon-root ../track_on --ckpt ../trackon2_dinov3_checkpoint.pt
   python run_video.py --video gate.mp4 --backend ort-cuda
@@ -67,6 +70,60 @@ def build_schedule(args, full):
   return add, rem, rem_box
 
 
+def load_dets(path, cols, xy_mode, classes, min_score):
+  """Detection file, one box per line, whitespace separated (e.g.
+  `frame id x y w h ? class score ...`). `cols` = column indices of
+  frame,x,y,w,h[,class[,score]]. Returns {frame: [(x, y, w, h, class, score), ...]}
+  with (x, y) the top-left corner."""
+  idx = [int(c) for c in cols.split(',')]
+  out = {}
+  with open(path) as f:
+    for line in f:
+      v = line.replace(',', ' ').split()
+      if len(v) <= max(idx[:5]) or v[0].startswith('#'):
+        continue
+      fr, x, y, w, h = (float(v[i]) for i in idx[:5])
+      cls = int(float(v[idx[5]])) if len(idx) > 5 else -1
+      score = float(v[idx[6]]) if len(idx) > 6 else 1.0
+      if w <= 0 or h <= 0 or score < min_score or (classes and cls not in classes):
+        continue
+      if xy_mode == 'center':
+        x, y = x - w / 2, y - h / 2
+      out.setdefault(int(fr), []).append((x, y, w, h, cls, score))
+  return out
+
+
+def iou(a, b):
+  ix = max(0.0, min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0]))
+  iy = max(0.0, min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1]))
+  inter = ix * iy
+  return inter / (a[2] * a[3] + b[2] * b[3] - inter + 1e-9)
+
+
+def unique_boxes(boxes, thr):
+  """Drop duplicate detections (IoU >= thr), keeping the higher-score box."""
+  keep = []
+  for b in sorted(boxes, key=lambda b: -b[5]):
+    if all(iou(b, k) < thr for k in keep):
+      keep.append(b)
+  return keep
+
+
+def sample_in_box(b, n, shrink, rng):
+  """n points spread over the box (stratified: one random point per cell of a
+  near-square grid, cells chosen at random), inside a margin of `shrink` x size."""
+  x, y, w, h = b[:4]
+  x0, y0, ww, hh = x + shrink * w, y + shrink * h, w * (1 - 2 * shrink), h * (1 - 2 * shrink)
+  cols = max(1, int(round(np.sqrt(n * ww / max(hh, 1e-6)))))
+  rows = max(1, int(np.ceil(n / cols)))
+  cells = rng.permutation(rows * cols)[:n] if rows * cols >= n else rng.integers(0, rows * cols, n)
+  pts = []
+  for c in cells:
+    r, k = divmod(int(c), cols)
+    pts.append((x0 + (k + rng.random()) * ww / cols, y0 + (r + rng.random()) * hh / rows))
+  return pts
+
+
 def pick(frame, t):
   pts, win = [], f'frame {t}: click points, Enter = done, c = clear'
   cv2.namedWindow(win, cv2.WINDOW_NORMAL)
@@ -111,6 +168,19 @@ def main():
   ap.add_argument('--reseed-grid', type=int, default=6)
   ap.add_argument('--reseed-box', help='x,y,w,h for re-seeding (default: ROI / full frame)')
   ap.add_argument('--drop-after', type=int, default=0, help='remove points invisible for N frames in a row')
+  ap.add_argument('--dets', help='detection file: every --det-every frames remove ALL points and '
+                  'sample --det-points points in each unique detection box of that frame')
+  ap.add_argument('--det-every', type=int, default=30, help='re-sample period in frames')
+  ap.add_argument('--det-points', type=int, default=10, help='points per detection box')
+  ap.add_argument('--det-cols', default='0,2,3,4,5,7,8',
+                  help='0-based columns of frame,x,y,w,h[,class[,score]] (default: frame id x y w h ? class score)')
+  ap.add_argument('--det-xy', choices=['tl', 'center'], default='tl', help='x,y is the top-left corner or the centre')
+  ap.add_argument('--det-classes', help='comma-separated classes to keep (default: all)')
+  ap.add_argument('--det-min-score', type=float, default=0.0)
+  ap.add_argument('--det-dedup-iou', type=float, default=0.9, help='boxes overlapping more than this are one box')
+  ap.add_argument('--det-shrink', type=float, default=0.15, help='keep points this fraction away from box edges')
+  ap.add_argument('--det-frame-offset', type=int, default=0, help='det frame = video frame index + offset')
+  ap.add_argument('--seed', type=int, default=0)
   ap.add_argument('--max-points', type=int, default=0, help='cap: drop the oldest points beyond this')
   ap.add_argument('--start', type=int, default=0)
   ap.add_argument('--max-frames', type=int, default=0)
@@ -145,6 +215,13 @@ def main():
   tracker = PointTracker(backend, roi=roi)
   add, rem, rem_box = build_schedule(args, full)
   reseed_box = box(args.reseed_box) if args.reseed_box else full
+  dets, point_box = {}, {}  # point id -> index of the detection box it was sampled in
+  if args.dets:
+    classes = {int(c) for c in args.det_classes.split(',')} if args.det_classes else None
+    dets = load_dets(args.dets, args.det_cols, args.det_xy, classes, args.det_min_score)
+    print(f'detections: {sum(len(v) for v in dets.values())} boxes on {len(dets)} frames; '
+          f'every {args.det_every} frames: {args.det_points} points per unique box')
+  rng = np.random.default_rng(args.seed)
 
   writer, out = None, None
   if not args.benchmark:
@@ -180,13 +257,25 @@ def main():
         new += pick(frame, t)
       if args.reseed_every and t > 0 and t % args.reseed_every == 0:
         new += grid(reseed_box, args.reseed_grid)
+      det_boxes = unique_boxes(dets.get(t + args.start + args.det_frame_offset, []), args.det_dedup_iou) if dets else []
+      det_new = []
+      if dets and t % args.det_every == 0:
+        ids_rm = list(tracker.ids) + [p[0] for p in tracker.pending]   # drop everything
+        for bi, b in enumerate(det_boxes):
+          det_new += [(x, y, bi) for x, y in sample_in_box(b, args.det_points, args.det_shrink, rng)]
+        new += [(x, y) for x, y, _ in det_new]
       if args.max_points and tracker.num_points + len(new) - len(set(ids_rm)) > args.max_points:
         over = tracker.num_points + len(new) - len(set(ids_rm)) - args.max_points
         ids_rm += [i for i in tracker.ids if i not in ids_rm][:over]   # oldest first
       if ids_rm:
         tracker.remove(ids_rm)
+        for i in ids_rm:
+          point_box.pop(i, None)
+      det_of = {(x, y): bi for x, y, bi in det_new}
       for x, y in new:
-        tracker.add(x, y)
+        i = tracker.add(x, y)
+        if (x, y) in det_of:
+          point_box[i] = det_of[(x, y)]
       if ids_rm or new:
         print(f'frame {t}: +{len(new)} -{len(set(ids_rm))} -> {tracker.num_points} points')
 
@@ -207,6 +296,8 @@ def main():
         vis = frame
         if roi:
           cv2.rectangle(vis, (int(roi[0]), int(roi[1])), (int(roi[0] + roi[2]), int(roi[1] + roi[3])), (255, 255, 255), 1)
+        for b in det_boxes:  # detections of this frame
+          cv2.rectangle(vis, (int(b[0]), int(b[1])), (int(b[0] + b[2]), int(b[1] + b[3])), (200, 200, 200), 1)
         for i in list(trails):
           if i not in res:
             del trails[i]
@@ -214,7 +305,7 @@ def main():
           tr = trails.setdefault(i, [])
           tr.append((int(s['x']), int(s['y']), s['visible']))
           del tr[:-args.trail]
-          c = color(i)
+          c = color(point_box[i] * 7 + 3) if i in point_box else color(i)
           for (x0, y0, v0), (x1, y1, v1) in zip(tr[:-1], tr[1:]):
             if (v0 and v1) or args.show_invisible:
               cv2.line(vis, (x0, y0), (x1, y1), c, 2, cv2.LINE_AA)
