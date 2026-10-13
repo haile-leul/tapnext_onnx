@@ -5,6 +5,7 @@
 //   tracker.removePoint(id);                  // any time
 //   const auto& pts = tracker.step(frameBgr);  // all active points
 //   for (auto& p : pts) { p.id, p.x, p.y, p.vx, p.vy, p.visProb, p.visible }
+//   float vx, vy;  if (tracker.medianVelocity(vehicleTrack.pointIds, vx, vy)) ...
 //
 // Per-point state (query feature, 72-frame memory, memory mask) lives on the GPU
 // in two ping-pong buffers. Removing points compacts the rows on the GPU, adding
@@ -41,6 +42,7 @@ class TrackOnTrt {
     float visProb = 0;     // sigmoid(visibility logit)
     bool visible = false;  // visProb >= deltaV (0.8, as in the official Predictor)
     int lost = 0;          // consecutive frames not visible
+    bool hasVelocity = false;  // false on the frame the point was added (vx = vy = 0)
   };
 
   // roi: part of the frame given to the model (empty = whole frame). It is
@@ -101,20 +103,20 @@ class TrackOnTrt {
   float encoderMs() const { return encMs_; }  // GPU time of the last step
   float trackerMs() const { return trkMs_; }
 
-  // Median velocity of the visible points inside a box (original px): a motion
-  // prior for anything rigidly attached to that object (e.g. faces in a car).
-  bool medianVelocity(const cv::Rect2f& box, float& vx, float& vy) const {
-    std::vector<float> xs, ys;
-    for (const auto& p : out_)
-      if (p.visible && box.contains({p.x, p.y})) xs.push_back(p.vx), ys.push_back(p.vy);
-    if (xs.empty()) return false;
-    auto med = [](std::vector<float>& v) {
-      std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
-      return v[v.size() / 2];
-    };
-    vx = med(xs);
-    vy = med(ys);
-    return true;
+  // Median velocity (px/frame) of the given point ids -- e.g. the ids you sampled
+  // from one vehicle detection and stored in its track. Uses only points that
+  // are visible and already have a velocity (not on the frame they were added).
+  // Returns the number of points used; 0 = no estimate (vx, vy untouched).
+  //   speed [px/s] = hypot(vx, vy) * fps,  direction = atan2(vy, vx)
+  int medianVelocity(const std::vector<int>& ids, float& vx, float& vy) const {
+    std::unordered_set<int> want(ids.begin(), ids.end());
+    return medianOf([&](const Point& p) { return want.count(p.id) > 0; }, vx, vy);
+  }
+
+  // Same, for the points currently inside a box (original px). Prefer the id
+  // version: a box can also contain points of an overlapping object.
+  int medianVelocity(const cv::Rect2f& box, float& vx, float& vy) const {
+    return medianOf([&](const Point& p) { return box.contains({p.x, p.y}); }, vx, vy);
   }
 
   const std::vector<Point>& step(const cv::Mat& bgr) {
@@ -179,6 +181,7 @@ class TrackOnTrt {
       if (it != prev_.end() && r < n_ - k) {
         pt.vx = pt.x - it->second.x;
         pt.vy = pt.y - it->second.y;
+        pt.hasVelocity = true;
         pt.lost = pt.visible ? 0 : it->second.lost + 1;
       } else {
         pt.lost = pt.visible ? 0 : 1;
@@ -202,6 +205,21 @@ class TrackOnTrt {
     template <class T>
     void operator()(T* p) const { delete p; }
   };
+
+  template <class Pred>
+  int medianOf(Pred use, float& vx, float& vy) const {
+    std::vector<float> xs, ys;
+    for (const auto& p : out_)
+      if (p.visible && p.hasVelocity && use(p)) xs.push_back(p.vx), ys.push_back(p.vy);
+    if (xs.empty()) return 0;
+    auto med = [](std::vector<float>& v) {
+      std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+      return v[v.size() / 2];
+    };
+    vx = med(xs);
+    vy = med(ys);
+    return int(xs.size());
+  }
 
   static void check(cudaError_t e) {
     if (e != cudaSuccess) throw std::runtime_error(cudaGetErrorString(e));

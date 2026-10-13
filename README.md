@@ -157,8 +157,10 @@ TrackOnTrt tracker("models/trackon_encoder.engine", "models/trackon_tracker.engi
 int id = tracker.addPoint(x, y);           // original pixels; tracked from the next step()
 tracker.removePoint(id);                   // any time
 const auto& pts = tracker.step(frameBgr);  // {id, x, y, vx, vy, visProb, visible, lost} per point
+// ids you sampled from one vehicle detection (keep them in its track object)
 float vx, vy;
-tracker.medianVelocity(vehicleBox, vx, vy);  // motion prior for faces inside that vehicle
+int used = tracker.medianVelocity(track.pointIds, vx, vy);  // px/frame, 0 = no estimate
+// speed = hypot(vx, vy) * fps [px/s], direction = atan2(vy, vx)
 ```
 
 The per-point state stays on the GPU, in two buffers that swap each frame:

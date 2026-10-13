@@ -54,6 +54,10 @@ int main(int argc, char** argv) {
       for (size_t i = 1; i < tr.size(); ++i) cv::line(frame, tr[i - 1], tr[i], c, 2, cv::LINE_AA);
       cv::circle(frame, tr.back(), 4, c, -1, cv::LINE_AA);
     }
+    // median motion of the first 8x8-grid row (ids 0..7), as you would do per vehicle track
+    float mvx = 0, mvy = 0;
+    const int used = tracker.medianVelocity(std::vector<int>{0, 1, 2, 3, 4, 5, 6, 7}, mvx, mvy);
+    if (t % 25 == 0 && used) std::printf("  ids 0..7: median v = (%.1f, %.1f) px/frame from %d points\n", mvx, mvy, used);
     char hud[160];
     std::snprintf(hud, sizeof(hud), "frame %d  %d points  step %.1f ms (GPU enc %.1f + trk %.1f)", t,
                   int(pts.size()), ms, tracker.encoderMs(), tracker.trackerMs());

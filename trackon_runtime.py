@@ -382,6 +382,16 @@ class PointTracker:
   def num_points(self):
     return len(self.ids) + len(self.pending)
 
+  def median_velocity(self, ids):
+    """Median (vx, vy) in px/frame of the given ids (visible points that already
+    have a velocity), plus the number of points used; (None, None, 0) if none."""
+    v = [(s['vx'], s['vy']) for i in ids for s in [self.state.get(i)]
+         if s and s['visible'] and s['has_v']]
+    if not v:
+      return None, None, 0
+    v = np.array(v)
+    return float(np.median(v[:, 0])), float(np.median(v[:, 1])), len(v)
+
   def step(self, frame_bgr):
     import cv2  # pylint: disable=g-import-not-at-top
     h, w = frame_bgr.shape[:2]
@@ -399,7 +409,8 @@ class PointTracker:
       prev = self.state.get(i)
       vx, vy = (0.0, 0.0) if (prev is None or i in born) else (x - prev['x'], y - prev['y'])
       lost = 0 if vis[row] >= self.delta_v else (prev['lost'] + 1 if prev else 1)
-      s = dict(x=x, y=y, vx=vx, vy=vy, vis=float(vis[row]), visible=bool(vis[row] >= self.delta_v), lost=lost)
+      s = dict(x=x, y=y, vx=vx, vy=vy, vis=float(vis[row]), visible=bool(vis[row] >= self.delta_v), lost=lost,
+               has_v=not (prev is None or i in born))
       self.state[i] = s
       out[i] = s
     self.t += 1
