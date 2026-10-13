@@ -72,8 +72,8 @@ def build_schedule(args, full):
 
 def load_dets(path, cols, xy_mode, classes, min_score):
   """Detection file, one box per line, whitespace separated (e.g.
-  `frame id x y w h ? class score ...`). `cols` = column indices of
-  frame,x,y,w,h[,class[,score]]. Returns {frame: [(x, y, w, h, class, score), ...]}
+  `frame id x y w h confidence class ...`). `cols` = column indices of
+  frame,x,y,w,h[,class[,confidence]]; boxes with confidence <= min_score are dropped. Returns {frame: [(x, y, w, h, class, score), ...]}
   with (x, y) the top-left corner."""
   idx = [int(c) for c in cols.split(',')]
   out = {}
@@ -85,7 +85,7 @@ def load_dets(path, cols, xy_mode, classes, min_score):
       fr, x, y, w, h = (float(v[i]) for i in idx[:5])
       cls = int(float(v[idx[5]])) if len(idx) > 5 else -1
       score = float(v[idx[6]]) if len(idx) > 6 else 1.0
-      if w <= 0 or h <= 0 or score < min_score or (classes and cls not in classes):
+      if w <= 0 or h <= 0 or score <= min_score or (classes and cls not in classes):
         continue
       if xy_mode == 'center':
         x, y = x - w / 2, y - h / 2
@@ -172,11 +172,13 @@ def main():
                   'sample --det-points points in each unique detection box of that frame')
   ap.add_argument('--det-every', type=int, default=30, help='re-sample period in frames')
   ap.add_argument('--det-points', type=int, default=10, help='points per detection box')
-  ap.add_argument('--det-cols', default='0,2,3,4,5,7,8',
-                  help='0-based columns of frame,x,y,w,h[,class[,score]] (default: frame id x y w h ? class score)')
+  ap.add_argument('--det-cols', default='0,2,3,4,5,7,6',
+                  help='0-based columns of frame,x,y,w,h[,class[,confidence]] '
+                       '(default: frame id x y w h confidence class ...; confidence = 7th column)')
   ap.add_argument('--det-xy', choices=['tl', 'center'], default='tl', help='x,y is the top-left corner or the centre')
   ap.add_argument('--det-classes', help='comma-separated classes to keep (default: all)')
-  ap.add_argument('--det-min-score', type=float, default=0.0)
+  ap.add_argument('--det-min-score', type=float, default=70.0,
+                  help='keep detections with confidence (7th column) above this (default 70)')
   ap.add_argument('--det-dedup-iou', type=float, default=0.9, help='boxes overlapping more than this are one box')
   ap.add_argument('--det-shrink', type=float, default=0.15, help='keep points this fraction away from box edges')
   ap.add_argument('--det-frame-offset', type=int, default=0, help='det frame = video frame index + offset')
